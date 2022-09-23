@@ -22,26 +22,58 @@ type foldername struct {
 
 var fn = &foldername {value: "day" }
 
+type persistRecord struct {
+	namespace     string
+	name          string
+	consumerGroup string
+	partitionID   string
+	checkpoint    persist.Checkpoint
+}
+
+type batchWriter struct {
+	persister 		persist.CheckpointPersister
+	dirdata   		string
+	writer    		io.Writer
+	sync.Mutex
+	batchSize      	int
+	batch          	[]string
+	persistRecords 	[]*persistRecord
+	flushed        	*persistRecord
+}
+
+var batchSize = 10
+
 func main() {
 
 	salirdelloop := false
 	interrupt := make(chan os.Signal,1)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	fp, err := persist.NewFilePersister(os.Getenv("EVENTHUB_FILEPERSIST_DIRECTORY"))
+	// create directory where to keep the last checkpoint
+	dirckp, err := persist.NewFilePersister("/tmp/checkpoint")
 	if err != nil {
 		fmt.Println(err.Error())
 		os.Exit(1)
 	}
-
+	// create directory where to keep the data window
+	dirdata := "/tmp/data"
+	if err != nil {
+		fmt.Println(err.Error())
+		os.Exit(1)
+	}
+	// create file for a given streaming window
+	f, err := os.OpenFile(dirdata, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+    if err != nil {
+        panic(err)
+    }
+    defer f.Close()
+    
+	// set consumer group
 	consumerGroup := os.Getenv("EVENTHUB_CONSUMERGROUP")
 	if consumerGroup == "" {
 		consumerGroup = "$Default"
 	}
 
-	output, err := NewBatchWriter(fp, os.Stdout)
+	output, err := NewBatchWriter(dirckp, f, dirdata)
 	if err != nil {
 		fmt.Println(err.Error())
 		os.Exit(1)
@@ -56,36 +88,17 @@ func main() {
 	}
 	defer hub.Close(ctx)
 
-	handler := func(ctx context.Context, event *eventhub.Event) error {
-		text := string(event.Data)
-		fmt.Println(string(event.Data))
-		return nil
-	}
-
-	ehruntime, _ := hub.GetRuntimeInformation(ctx)
-	partitions := ehruntime.PartitionIDs
-	for _, partitionID := range partitions {
-		_, err := hub.Receive(ctx, partitionID, output.HandleEvent, eventhub.ReceiveWithLatestOffset())
-		if err != nil {
-			fmt.Println("Error: ", err)
-			return
-		}
-	}
-
-	fmt.Println("I am listening...")
-
-
 	ticker := time.NewTicker(2*time.Second)
 	for {
 		log.Println("primera linea for")
 		select {
 			case <- ticker.C:
-				createNewFolder()
+				createNewFolderandSaveFile()
 				go startPipeline()
 			case <- interrupt:
 				salirdelloop = true
 			default:
-				readEvent()
+				readEvent(hub, output)
 		}		
 		if salirdelloop {
 			break
@@ -100,9 +113,20 @@ func createNewFolder() {
 	fn.Unlock()
 }
 
-func readEvent() {
-	log.Println("leyendo event")
-	time.Sleep(5*time.Second)
+func readEvent(hub *eventhub.Hub, output *batchWriter) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	log.Println("leyendo event ...")
+	ehruntime, _ := hub.GetRuntimeInformation(ctx)
+	partitions := ehruntime.PartitionIDs
+	for _, partitionID := range partitions {
+		_, err := hub.Receive(ctx, partitionID, output.HandleEvent, eventhub.ReceiveWithLatestOffset())
+		if err != nil {
+			fmt.Println("Error: ", err)
+			return
+		}
+	}
 }
 
 func startPipeline() {
@@ -111,30 +135,12 @@ func startPipeline() {
 	//startpipeline()
 }
 
-type persistRecord struct {
-	namespace     string
-	name          string
-	consumerGroup string
-	partitionID   string
-	checkpoint    persist.Checkpoint
-}
-
-type batchWriter struct {
-	persister persist.CheckpointPersister
-	writer    io.Writer
-
-	batchSize      int
-	batch          []string
-	persistRecords []*persistRecord
-	flushed        *persistRecord
-}
-
-var batchSize = 10
 
 // NewBatchWriter creates an object that can be used as both a `persist.CheckpointPersister` and an Event Hubs Event Handler `batchWriter.HandleEvent`
-func NewBatchWriter(persister persist.CheckpointPersister, writer io.Writer) (*batchWriter, error) {
+func NewBatchWriter(persister persist.CheckpointPersister, writer io.Writer, dirdata string) (*batchWriter, error) {
 	return &batchWriter{
 		persister:      persister,
+		dirdata: 		dirdata,
 		writer:         writer,
 		batchSize:      batchSize,
 		batch:          make([]string, 0, batchSize),

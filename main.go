@@ -47,7 +47,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	connStr := "Endpoint=sb://EventHubNameSpaceCNM.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=xxxxxxxxxxx;EntityPath=Stockmarketsimulator2"
+	connStr := "Endpoint=sb://EventHubNameSpace.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=xxxxxxxxxxx;EntityPath=Stockmarketsimulator2"
 	hub, err := eventhub.NewHubFromConnectionString(connStr)
 
 	if err != nil {

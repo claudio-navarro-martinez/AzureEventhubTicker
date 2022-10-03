@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"os"
 	"strconv"
 	"sync"
@@ -12,15 +13,13 @@ import (
 
 	eventhub "github.com/Azure/azure-event-hubs-go/v3"
 	"github.com/Azure/azure-event-hubs-go/v3/persist"
+	//"github.com/micro/go-micro/v2/util/ctx"
 )
 
-type foldername struct {
-	value string
-	count uint64
-	sync.Mutex
-}
-
-var fn = &foldername {value: "day" }
+const (
+	MAX = 150
+	MIN = 100
+)
 
 type persistRecord struct {
 	namespace     string
@@ -34,16 +33,19 @@ type batchWriter struct {
 	persister 		persist.CheckpointPersister
 	dirdata   		string
 	writer    		io.Writer
-	sync.Mutex
+	mu				sync.Mutex
 	batchSize      	int
 	batch          	[]string
 	persistRecords 	[]*persistRecord
 	flushed        	*persistRecord
+	nextid			int
 }
 
 var batchSize = 10
 
 func main() {
+
+	go ProduceEventHub()
 
 	salirdelloop := false
 	interrupt := make(chan os.Signal,1)
@@ -60,25 +62,29 @@ func main() {
 		fmt.Println(err.Error())
 		os.Exit(1)
 	}
-	// create file for a given streaming window
-	f, err := os.OpenFile(dirdata, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
-    if err != nil {
-        panic(err)
-    }
-    defer f.Close()
-    
+	
 	// set consumer group
 	consumerGroup := os.Getenv("EVENTHUB_CONSUMERGROUP")
 	if consumerGroup == "" {
 		consumerGroup = "$Default"
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
+	// create file for a given streaming window
+	f, err := os.OpenFile(dirdata+"/"+"pipeline"+strconv.Itoa(1), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+	if err != nil {
+			panic(err)
+	}
+	defer f.Close()
+	
 	output, err := NewBatchWriter(dirckp, f, dirdata)
 	if err != nil {
 		fmt.Println(err.Error())
 		os.Exit(1)
 	}
 
+    
 	connStr := "Endpoint=sb://EventHubNameSpace.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=xxxxxxxxxxx;EntityPath=Stockmarketsimulator2"
 	hub, err := eventhub.NewHubFromConnectionString(connStr)
 
@@ -88,17 +94,34 @@ func main() {
 	}
 	defer hub.Close(ctx)
 
+	eventhub.NewHubFromEnvironment(eventhub.HubWithOffsetPersistence(output))
+	
+	ehruntime, _ := hub.GetRuntimeInformation(ctx)
+	log.Println(ehruntime.Path)
+	
+	partitions := ehruntime.PartitionIDs
+	for _, partitionID := range partitions {
+		// receive enters in a for{} loop, receiving msg continuosly
+		//_, err := hub.Receive(ctx, partitionID, output.HandleEvent, eventhub.ReceiveWithLatestOffset())
+		_, err := hub.Receive(ctx, partitionID, output.HandleEvent, eventhub.ReceiveWithStartingOffset(""))
+		if err != nil {
+			fmt.Println("Error: ", err)
+			return
+		}
+	}
+
 	ticker := time.NewTicker(2*time.Second)
 	for {
 		log.Println("primera linea for")
 		select {
 			case <- ticker.C:
-				createNewFolderandSaveFile()
+				output.mu.Lock()
+				output.Flush(ctx)
+				switchFile(output)
+				output.mu.Unlock()
 				go startPipeline()
 			case <- interrupt:
 				salirdelloop = true
-			default:
-				readEvent(hub, output)
 		}		
 		if salirdelloop {
 			break
@@ -106,27 +129,14 @@ func main() {
 	}
 }
 
-func createNewFolder() {
-	fn.Lock()
-	fn.count ++
-	fn.value = fn.value + strconv.Itoa(int(fn.count))
-	fn.Unlock()
-}
-
-func readEvent(hub *eventhub.Hub, output *batchWriter) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	log.Println("leyendo event ...")
-	ehruntime, _ := hub.GetRuntimeInformation(ctx)
-	partitions := ehruntime.PartitionIDs
-	for _, partitionID := range partitions {
-		_, err := hub.Receive(ctx, partitionID, output.HandleEvent, eventhub.ReceiveWithLatestOffset())
-		if err != nil {
-			fmt.Println("Error: ", err)
-			return
-		}
-	}
+func switchFile(o *batchWriter) {
+	// create file for a given streaming window
+	o.nextid ++
+	f, err := os.OpenFile(o.dirdata+"/"+"pipeline"+strconv.Itoa(o.nextid), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+    if err != nil {
+        panic(err)
+    }
+    defer f.Close()
 }
 
 func startPipeline() {
@@ -145,18 +155,19 @@ func NewBatchWriter(persister persist.CheckpointPersister, writer io.Writer, dir
 		batchSize:      batchSize,
 		batch:          make([]string, 0, batchSize),
 		persistRecords: make([]*persistRecord, 0, batchSize),
+		nextid:			1,
 	}, nil
 }
 
 // Read reads the last checkpoint
-func (w batchWriter) Read(namespace, name, consumerGroup, partitionID string) (persist.Checkpoint, error) {
+func (w *batchWriter) Read(namespace, name, consumerGroup, partitionID string) (persist.Checkpoint, error) {
 	return w.persister.Read(namespace, name, consumerGroup, partitionID)
 }
 
 // Write will write the last checkpoint of the last event flushed and record persist records for future use
 func (w *batchWriter) Write(namespace, name, consumerGroup, partitionID string, checkpoint persist.Checkpoint) error {
 	var err error
-	if w.flushed != nil {
+	if w.flushed != nil {	
 		r := w.flushed
 		err = w.persister.Write(r.namespace, r.name, r.consumerGroup, r.partitionID, r.checkpoint)
 		if err != nil {
@@ -172,11 +183,11 @@ func (w *batchWriter) Write(namespace, name, consumerGroup, partitionID string, 
 	})
 	return err
 }
-
 // HandleEvent will handle Event Hubs Events
 // If the length of the batch buffer has reached the max batchSize, the buffer will be flushed before appending the new event
 // If flush fails and it hasn't made space in the buffer, the flush error will be returned to the caller
 func (w *batchWriter) HandleEvent(ctx context.Context, event *eventhub.Event) error {
+	w.mu.Lock()
 	if len(w.batch) >= batchSize {
 		err := w.Flush(ctx)
 		// If we received an error flushing and still don't have room in the buffer return the error
@@ -185,7 +196,8 @@ func (w *batchWriter) HandleEvent(ctx context.Context, event *eventhub.Event) er
 		}
 	}
 	// Append the event to the buffer if we have room for it
-	w.batch = append(w.batch, string(event.Data))
+	w.batch  = append(w.batch, string(event.Data))
+	w.mu.Unlock()
 	return nil
 }
 
@@ -197,13 +209,52 @@ func (w *batchWriter) Flush(ctx context.Context) error {
 	for i, s := range w.batch {
 		_, err := fmt.Fprintln(w.writer, s)
 		if err != nil {
-			w.batch = w.batch[i:]
+			w.batch  = w.batch[i:]
 			w.persistRecords = w.persistRecords[i:]
 			return err
 		}
 		w.flushed = w.persistRecords[i]
 	}
-	w.batch = make([]string, 0, batchSize)
+	w.batch  = make([]string, 0, batchSize)
 	w.persistRecords = make([]*persistRecord, 0, batchSize)
 	return nil
+}
+
+func ProduceEventHub() {
+	connStr := "Endpoint=sb://EventHubNameSpaceCNM.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=VjOiSq7sAloTVHayp/g2kVt5EbVQYblWa8ymRyvBBxE=;EntityPath=Stockmarketsimulator2"
+	hub, err := eventhub.NewHubFromConnectionString(connStr)
+
+	if err != nil {
+		fmt.Println(err)	
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// send intraday values to Azure Eventhub for GOOG
+	for k := 1; k < 101; k++ {
+		rand.Seed(time.Now().UnixNano())
+
+		r1 := rand.Intn(MAX-MIN) + MIN
+		r2 := rand.Intn(MAX-MIN) + MIN
+		if r1 > r2 {
+			r1, r2 = r2, r1
+		}
+		t := time.Now()
+		formatted := fmt.Sprintf("%d-%02d-%02d %02d:%02d:%02d", t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second())
+		fmt.Println(formatted)
+
+		err = hub.Send(ctx, eventhub.NewEventFromString(formatted))
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+	}
+
+	err = hub.Close(context.Background())
+	if err != nil {
+		fmt.Println(err)
+	}
+
 }
